@@ -2,14 +2,18 @@
 #
 # Builds, tests and publishes releases of the rootfs_mount fork (see FORK.md).
 # - push of a tag v<upstream-version>-rootfs.<n> on main: test, build, create a GitHub release.
-# - workflow_dispatch: dry run. Tests and builds, uploads the binaries as a workflow
-#   artifact, never creates a release.
+# - workflow_dispatch, or a PR that changes this file: dry run. Tests and builds,
+#   uploads the binaries as a workflow artifact, never creates a release.
 name: Fork release
 
 on:
   push:
     tags:
       - "v*-rootfs.*"
+  # Dry run for PRs that change this workflow.
+  pull_request:
+    paths:
+      - .github/workflows/fork-release.yml
   workflow_dispatch:
     inputs:
       version:

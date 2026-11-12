@@ -46,7 +46,8 @@ keeps upstream's value, which avoids merge conflicts.
    builds the binaries and creates a normal GitHub release (not a prerelease) marked latest.
 
 To try a build without releasing, start a dry run from any branch. It tests and builds, then
-uploads the binaries as a workflow artifact:
+uploads the binaries as a workflow artifact. A PR that changes `fork-release.yml` gets a dry run
+automatically.
 
 ```sh
 gh workflow run fork-release.yml --repo nik-johnson-net/nomad-driver-podman --ref <branch> -f version=0.6.6-rootfs.1
