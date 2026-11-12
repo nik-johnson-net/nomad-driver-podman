@@ -1,0 +1,214 @@
+# FORK-ONLY: nik-johnson-net/nomad-driver-podman. Do not upstream this file.
+#
+# Builds, tests and publishes releases of the rootfs_mount fork (see FORK.md).
+# - push of a tag v<upstream-version>-rootfs.<n> on main: test, build, create a GitHub release.
+# - workflow_dispatch: dry run. Tests and builds, uploads the binaries as a workflow
+#   artifact, never creates a release.
+name: Fork release
+
+on:
+  push:
+    tags:
+      - "v*-rootfs.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to stamp into the dry-run build, without the leading v
+          (e.g. 0.6.6-rootfs.1). Empty: <version.go version>+dryrun.<sha>.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PKG_NAME: nomad-driver-podman
+
+jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Determine and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+            if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rootfs\.[0-9]+$ ]]; then
+              echo "::error::Tag '$tag' does not match v<upstream-version>-rootfs.<n> (e.g. v0.6.6-rootfs.1)"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::Tag '$tag' ($GITHUB_SHA) is not on main. Merge first, then tag a commit on main."
+              exit 1
+            fi
+            version="${tag#v}"
+          else
+            tag=""
+            version="${INPUT_VERSION:-$(make --no-print-directory version)+dryrun.${GITHUB_SHA::7}}"
+          fi
+          # Nomad rejects plugins whose version github.com/hashicorp/go-version cannot parse.
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if ! [[ "$version" =~ $semver ]]; then
+            echo "::error::Version '$version' is not a valid semantic version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Version: $version (tag: ${tag:-none, dry run})"
+
+  # Same steps as tests.yml (lint + full test suite against rootful podman). This
+  # binary replaces the stock podman driver for every job, so nothing ships if it fails.
+  test:
+    name: Lint and test (rootful podman)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Equivalent of hashicorp/setup-golang@v3 (used by tests.yml) with first-party actions.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          cache-dependency-path: "**/*.sum"
+      - name: Put Makefile tools on PATH (as hashicorp/setup-golang does)
+        run: echo "GOBIN=$(go env GOROOT)/bin" >> "$GITHUB_ENV"
+      - name: Machine Setup
+        run: sudo .github/machinesetup.sh
+      - name: Make Setup
+        run: |
+          make deps
+          make check
+          make dev
+      - name: Make test
+        run: sudo -E env "PATH=$PATH" make test-ci
+
+  build:
+    name: Build linux binaries
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          cache-dependency-path: "**/*.sum"
+      - name: Build
+        run: |
+          set -euo pipefail
+          # Same flags as upstream's release build (GNUmakefile dist/%/nomad-driver-podman),
+          # plus -X overrides of upstream's version package so PluginInfo reports $VERSION.
+          pkg="$(go list -m)/version"
+          ldflags="-X ${pkg}.Version=${VERSION} -X ${pkg}.VersionPrerelease="
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags "$ldflags" -o "dist/${PKG_NAME}_linux_${arch}" .
+          done
+          (cd dist && sha256sum "${PKG_NAME}"_linux_* > SHA256SUMS)
+      - name: Verify version stamp
+        run: |
+          set -euo pipefail
+          pkg="$(go list -m)/version"
+          for bin in dist/"${PKG_NAME}"_linux_*; do
+            # The linker silently ignores -X for a symbol that does not exist, so check both.
+            go version -m "$bin" | grep -F -- "-X ${pkg}.Version=${VERSION} "
+            go tool nm "$bin" | awk '{print $NF}' | grep -xF "${pkg}.Version"
+          done
+          file dist/"${PKG_NAME}"_linux_*
+          cat dist/SHA256SUMS
+      - name: Summary
+        run: |
+          {
+            echo "### ${PKG_NAME} ${VERSION}"
+            if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+              echo "Dry run (${GITHUB_EVENT_NAME}): no release is created."
+            fi
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.PKG_NAME }}_${{ env.VERSION }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: [version, test, build]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.PKG_NAME }}_${{ env.VERSION }}
+          path: dist/
+      - name: Verify checksums
+        run: cd dist && sha256sum -c SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="${VERSION%%-rootfs.*}"
+          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          upstream_url="${GITHUB_SERVER_URL}/hashicorp/nomad-driver-podman"
+          dl="${repo_url}/releases/download/${TAG}"
+          prev="$(git tag --list 'v*-rootfs.*' --sort=v:refname | grep -B1 -xF "$TAG" | grep -vxF "$TAG" || true)"
+          {
+            echo "Fork build of nomad-driver-podman: upstream [v${base}](${upstream_url}/releases/tag/v${base}) plus \`rootfs_mount\`."
+            echo "Registers as the \`podman\` plugin and replaces the stock driver. See [FORK.md](${repo_url}/blob/${TAG}/FORK.md)."
+            echo
+            echo "- Fork changes vs upstream main: ${upstream_url}/compare/main...${GITHUB_REPOSITORY_OWNER}:${GITHUB_REPOSITORY#*/}:${TAG}"
+            if [ -n "$prev" ]; then
+              echo "- Changes since ${prev}: ${repo_url}/compare/${prev}...${TAG}"
+            fi
+            echo
+            echo "Assets are static linux binaries (\`CGO_ENABLED=0 go build -trimpath\`). \`SHA256SUMS\` is \`sha256sum\` output."
+            echo
+            echo '```yaml'
+            echo "- ansible.builtin.get_url:"
+            echo "    url: ${dl}/${PKG_NAME}_linux_amd64"
+            echo "    checksum: sha256:${dl}/SHA256SUMS"
+            echo "    dest: /opt/nomad/plugins/${PKG_NAME}"
+            echo "    mode: \"0755\""
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest
