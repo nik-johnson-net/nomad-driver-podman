@@ -5,8 +5,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -20,6 +22,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -161,7 +164,7 @@ func TestPodmanDriver_Start_NoImage(t *testing.T) {
 
 	_, _, err := d.StartTask(task)
 	must.Error(t, err)
-	must.ErrorContains(t, err, "image name required")
+	must.ErrorContains(t, err, "either image or rootfs_mount must be set")
 
 	_ = d.DestroyTask(task.ID, true)
 }
@@ -4025,4 +4028,605 @@ func TestEscapesParentDir(t *testing.T) {
 		absChildErr := fmt.Sprintf("Rel: can't make %s relative to ./parent", absFile)
 		must.EqError(t, escapesParentDir("./parent", absFile), absChildErr)
 	})
+}
+
+// TestRootfsMount verifies the selection of the task mount used by rootfs_mount.
+func TestRootfsMount(t *testing.T) {
+	ci.Parallel(t)
+
+	data := &drivers.MountConfig{TaskPath: "/data", HostPath: "/srv/data"}
+	rootfs := &drivers.MountConfig{TaskPath: "/.rootfs", HostPath: "/srv/rootfs"}
+	readonly := &drivers.MountConfig{TaskPath: "/.rootfs", HostPath: "/srv/rootfs", Readonly: true}
+
+	cases := []struct {
+		name        string
+		mounts      []*drivers.MountConfig
+		rootfsMount string
+		expect      *drivers.MountConfig
+		expectErr   string
+	}{
+		{
+			name:        "matches the volume mount destination",
+			mounts:      []*drivers.MountConfig{data, rootfs},
+			rootfsMount: "/.rootfs",
+			expect:      rootfs,
+		},
+		{
+			name:        "paths are compared in clean form",
+			mounts:      []*drivers.MountConfig{data, rootfs},
+			rootfsMount: "/.rootfs/",
+			expect:      rootfs,
+		},
+		{
+			name:        "no matching volume mount",
+			mounts:      []*drivers.MountConfig{data},
+			rootfsMount: "/.rootfs",
+			expectErr:   `rootfs_mount "/.rootfs" does not match the destination of any volume_mount of the task`,
+		},
+		{
+			name:        "no volume mounts",
+			rootfsMount: "/.rootfs",
+			expectErr:   `rootfs_mount "/.rootfs" does not match the destination of any volume_mount of the task`,
+		},
+		{
+			name:        "read-only volume mount",
+			mounts:      []*drivers.MountConfig{data, readonly},
+			rootfsMount: "/.rootfs",
+			expectErr:   `rootfs_mount "/.rootfs" refers to a read-only volume mount, the root filesystem must be writable`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &drivers.TaskConfig{Mounts: tc.mounts}
+			m, err := rootfsMount(task, &TaskConfig{RootfsMount: tc.rootfsMount})
+			if tc.expectErr == "" {
+				must.NoError(t, err)
+				must.Eq(t, tc.expect, m)
+			} else {
+				must.EqError(t, err, tc.expectErr)
+				must.Nil(t, m)
+			}
+		})
+	}
+}
+
+// TestContainerMounts_RootfsMount verifies that the volume mount used as the
+// root filesystem is not also bind mounted into the container.
+func TestContainerMounts_RootfsMount(t *testing.T) {
+	ci.Parallel(t)
+
+	d := &Driver{
+		logger: testlog.HCLogger(t),
+		config: &PluginConfig{
+			Volumes: VolumeConfig{Enabled: true},
+		},
+	}
+
+	task := &drivers.TaskConfig{
+		Name:     "web",
+		AllocDir: t.TempDir(),
+		Env:      map[string]string{},
+		Mounts: []*drivers.MountConfig{
+			{TaskPath: "/data", HostPath: "/srv/data"},
+			{TaskPath: "/.rootfs", HostPath: "/srv/rootfs"},
+		},
+	}
+
+	// sources of the bind mounts created for task.Mounts
+	volumeSources := func(mounts []spec.Mount) []string {
+		var srcs []string
+		for _, m := range mounts {
+			if strings.HasPrefix(m.Source, "/srv/") {
+				srcs = append(srcs, m.Source)
+			}
+		}
+		return srcs
+	}
+
+	t.Run("without rootfs_mount all volume mounts are bound", func(t *testing.T) {
+		mounts, err := d.containerMounts(task, &TaskConfig{Image: "busybox"})
+		must.NoError(t, err)
+		must.Eq(t, []string{"/srv/data", "/srv/rootfs"}, volumeSources(mounts))
+	})
+
+	t.Run("the rootfs_mount volume mount is skipped", func(t *testing.T) {
+		mounts, err := d.containerMounts(task, &TaskConfig{RootfsMount: "/.rootfs"})
+		must.NoError(t, err)
+		must.Eq(t, []string{"/srv/data"}, volumeSources(mounts))
+	})
+}
+
+// TestPodmanDriver_RootfsMount_Invalid verifies that StartTask rejects invalid
+// rootfs_mount configurations before creating a container.
+func TestPodmanDriver_RootfsMount_Invalid(t *testing.T) {
+	ci.Parallel(t)
+
+	cases := []struct {
+		name      string
+		taskCfg   TaskConfig
+		mounts    []*drivers.MountConfig
+		expectErr string
+	}{
+		{
+			name: "image and rootfs_mount",
+			taskCfg: TaskConfig{
+				Image:       "docker.io/library/busybox:latest",
+				RootfsMount: "/.rootfs",
+				Command:     "/sbin/init",
+			},
+			mounts:    []*drivers.MountConfig{{TaskPath: "/.rootfs", HostPath: "/srv/rootfs"}},
+			expectErr: "image and rootfs_mount are mutually exclusive",
+		},
+		{
+			name: "no command",
+			taskCfg: TaskConfig{
+				RootfsMount: "/.rootfs",
+			},
+			mounts:    []*drivers.MountConfig{{TaskPath: "/.rootfs", HostPath: "/srv/rootfs"}},
+			expectErr: "rootfs_mount requires command or entrypoint to be set",
+		},
+		{
+			name: "no matching volume mount",
+			taskCfg: TaskConfig{
+				RootfsMount: "/.rootfs",
+				Command:     "/sbin/init",
+			},
+			mounts:    []*drivers.MountConfig{{TaskPath: "/data", HostPath: "/srv/data"}},
+			expectErr: "does not match the destination of any volume_mount",
+		},
+		{
+			name: "read-only volume mount",
+			taskCfg: TaskConfig{
+				RootfsMount: "/.rootfs",
+				Command:     "/sbin/init",
+			},
+			mounts:    []*drivers.MountConfig{{TaskPath: "/.rootfs", HostPath: "/srv/rootfs", Readonly: true}},
+			expectErr: "refers to a read-only volume mount",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.taskCfg.Socket = "default"
+			task := &drivers.TaskConfig{
+				ID:        uuid.Generate(),
+				Name:      "rootfs_invalid",
+				AllocID:   uuid.Generate(),
+				Resources: createBasicResources(),
+				Mounts:    tc.mounts,
+			}
+			must.NoError(t, task.EncodeConcreteDriverConfig(&tc.taskCfg))
+
+			d := podmanDriverHarness(t, nil)
+			cleanup := d.MkAllocDir(task, false)
+			defer cleanup()
+
+			_, _, err := d.StartTask(task)
+			must.ErrorContains(t, err, tc.expectErr)
+
+			_ = d.DestroyTask(task.ID, true)
+		})
+	}
+}
+
+// exportRootfs creates a directory holding the root filesystem of a busybox
+// container, to be used as a rootfs_mount volume. It requires the podman CLI.
+func exportRootfs(t *testing.T) string {
+	t.Helper()
+
+	if _, err := exec.LookPath("podman"); err != nil {
+		t.Skip("Skipping rootfs_mount test because the podman CLI is not installed")
+	}
+
+	name := fmt.Sprintf("rootfs-src-%s", uuid.Generate()[:8])
+	out, err := exec.Command("podman", "create", "--name", name, "docker.io/library/busybox:latest", "true").CombinedOutput()
+	must.NoError(t, err, must.Sprintf("podman create: %s", out))
+	defer func() {
+		_, _ = exec.Command("podman", "rm", "--force", name).CombinedOutput()
+	}()
+
+	archive := filepath.Join(t.TempDir(), "rootfs.tar")
+	out, err = exec.Command("podman", "export", "--output", archive, name).CombinedOutput()
+	must.NoError(t, err, must.Sprintf("podman export: %s", out))
+
+	rootfs := t.TempDir()
+	out, err = exec.Command("tar", "-xf", archive, "-C", rootfs).CombinedOutput()
+	must.NoError(t, err, must.Sprintf("tar: %s", out))
+	return rootfs
+}
+
+// runRootfsTask starts the task, waits for it to exit and returns its exit
+// result and the inspect data of its container, which is removed afterwards.
+func runRootfsTask(t *testing.T, d *dtestutil.DriverHarness, task *drivers.TaskConfig) (*drivers.ExitResult, api.InspectContainerData) {
+	t.Helper()
+
+	_, _, err := d.StartTask(task)
+	must.NoError(t, err)
+	defer func() {
+		must.NoError(t, d.DestroyTask(task.ID, true))
+	}()
+
+	waitCh, err := d.WaitTask(context.Background(), task.ID)
+	must.NoError(t, err)
+
+	var res *drivers.ExitResult
+	select {
+	case res = <-waitCh:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("Container did not exit in time")
+	}
+
+	inspectData, err := getPodmanDriver(t, d).defaultPodman.ContainerInspect(context.Background(), BuildContainerName(task))
+	must.NoError(t, err)
+	return res, inspectData
+}
+
+// TestPodmanDriver_RootfsMount boots a container from a host volume mount
+// instead of an image and verifies that writes to its root filesystem persist
+// across a restart, which recreates the container.
+func TestPodmanDriver_RootfsMount(t *testing.T) {
+	ci.Parallel(t)
+
+	rootfs := exportRootfs(t)
+	// a file put into the volume on the host must be visible in the container
+	must.NoError(t, os.WriteFile(filepath.Join(rootfs, "host-marker"), []byte("from-host"), 0644))
+
+	task := &drivers.TaskConfig{
+		ID:        uuid.Generate(),
+		Name:      "rootfs_mount",
+		AllocID:   uuid.Generate(),
+		Resources: createBasicResources(),
+		Mounts: []*drivers.MountConfig{{
+			TaskPath: "/.rootfs",
+			HostPath: rootfs,
+		}},
+	}
+	setScript := func(script string) {
+		taskCfg := TaskConfig{
+			RootfsMount: "/.rootfs",
+			Command:     "sh",
+			Args:        []string{"-c", script},
+			Socket:      "default",
+		}
+		must.NoError(t, task.EncodeConcreteDriverConfig(&taskCfg))
+	}
+
+	d := podmanDriverHarness(t, nil)
+	cleanup := d.MkAllocDir(task, true)
+	defer cleanup()
+
+	// first run: the container sees the file put there by the host, writes
+	// into its root filesystem, and the volume is not also bind mounted into it
+	setScript(`test "$(cat /host-marker)" = from-host && test ! -e /.rootfs && echo first > /etc/rootfs-persist`)
+	res, inspectData := runRootfsTask(t, d, task)
+	must.True(t, res.Successful(), must.Sprintf("first run failed: %#v", res))
+	must.Eq(t, rootfs, inspectData.Rootfs)
+	for _, m := range inspectData.Mounts {
+		must.NotEq(t, "/.rootfs", m.Destination)
+	}
+
+	persisted, err := os.ReadFile(filepath.Join(rootfs, "etc", "rootfs-persist"))
+	must.NoError(t, err)
+	must.Eq(t, "first\n", string(persisted))
+
+	// second run, in a new container: the write of the first run is still there
+	setScript(`test "$(cat /etc/rootfs-persist)" = first && echo second >> /etc/rootfs-persist`)
+	res, _ = runRootfsTask(t, d, task)
+	must.True(t, res.Successful(), must.Sprintf("second run failed: %#v", res))
+
+	persisted, err = os.ReadFile(filepath.Join(rootfs, "etc", "rootfs-persist"))
+	must.NoError(t, err)
+	must.Eq(t, "first\nsecond\n", string(persisted))
+}
+
+// TestPodmanDriver_RootfsMount_Systemd verifies that podman enables systemd
+// mode for a container booted from rootfs_mount when the command is
+// /sbin/init, even though there is no image.
+func TestPodmanDriver_RootfsMount_Systemd(t *testing.T) {
+	ci.Parallel(t)
+
+	rootfs := exportRootfs(t)
+	// stand-in for systemd: record the mounts podman set up and exit
+	must.NoError(t, os.MkdirAll(filepath.Join(rootfs, "sbin"), 0755))
+	initScript := "#!/bin/sh\ncat /proc/mounts > /init-mounts\n"
+	must.NoError(t, os.WriteFile(filepath.Join(rootfs, "sbin", "init"), []byte(initScript), 0755))
+
+	taskCfg := TaskConfig{
+		RootfsMount: "/.rootfs",
+		Command:     "/sbin/init",
+		Socket:      "default",
+	}
+	task := &drivers.TaskConfig{
+		ID:        uuid.Generate(),
+		Name:      "rootfs_mount_systemd",
+		AllocID:   uuid.Generate(),
+		Resources: createBasicResources(),
+		Mounts: []*drivers.MountConfig{{
+			TaskPath: "/.rootfs",
+			HostPath: rootfs,
+		}},
+	}
+	must.NoError(t, task.EncodeConcreteDriverConfig(&taskCfg))
+
+	d := podmanDriverHarness(t, nil)
+	cleanup := d.MkAllocDir(task, true)
+	defer cleanup()
+
+	res, inspectData := runRootfsTask(t, d, task)
+	must.True(t, res.Successful(), must.Sprintf("init failed: %#v", res))
+	must.True(t, inspectData.Config.SystemdMode)
+
+	// in systemd mode podman mounts tmpfs file systems on /run and /run/lock
+	mounts, err := os.ReadFile(filepath.Join(rootfs, "init-mounts"))
+	must.NoError(t, err)
+	must.StrContains(t, string(mounts), " /run tmpfs ")
+	must.StrContains(t, string(mounts), " /run/lock tmpfs ")
+}
+
+// TestPodmanDriver_ContainerCreateRequest captures the container create
+// request StartTask sends to a fake Podman API. It locks in that image based
+// tasks are unaffected by rootfs_mount, and checks what rootfs_mount sends.
+func TestPodmanDriver_ContainerCreateRequest(t *testing.T) {
+	ci.Parallel(t)
+
+	const imageID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	cases := []struct {
+		name    string
+		taskCfg TaskConfig
+		mounts  []*drivers.MountConfig
+		check   func(t *testing.T, body map[string]any, paths []string)
+	}{
+		{
+			name:    "image task",
+			taskCfg: newTaskConfig("", []string{"sleep", "5"}),
+			mounts:  []*drivers.MountConfig{{TaskPath: "/data", HostPath: "/srv/data"}},
+			check: func(t *testing.T, body map[string]any, paths []string) {
+				must.Eq[any](t, imageID, body["image"])
+				must.MapNotContainsKey(t, body, "rootfs")
+				must.Eq[any](t, []any{"sleep", "5"}, body["command"])
+				must.SliceContains(t, paths, "/v1.0.0/libpod/images/docker.io/library/busybox:latest/json")
+				must.SliceContains(t, mountDestinations(t, body), "/data")
+			},
+		},
+		{
+			name: "rootfs_mount task",
+			taskCfg: TaskConfig{
+				RootfsMount: "/.rootfs",
+				Command:     "/sbin/init",
+				Socket:      "default",
+			},
+			mounts: []*drivers.MountConfig{
+				{TaskPath: "/data", HostPath: "/srv/data"},
+				{TaskPath: "/.rootfs", HostPath: "/srv/rootfs"},
+			},
+			check: func(t *testing.T, body map[string]any, paths []string) {
+				must.Eq[any](t, "/srv/rootfs", body["rootfs"])
+				must.Eq[any](t, "", body["image"])
+				must.Eq[any](t, []any{"/sbin/init"}, body["command"])
+				for _, p := range paths {
+					must.StrNotContains(t, p, "/images/", must.Sprint("no image may be inspected or pulled"))
+				}
+				must.SliceContains(t, mountDestinations(t, body), "/data")
+				must.SliceNotContains(t, mountDestinations(t, body), "/.rootfs")
+			},
+		},
+		{
+			name: "rootfs_mount task with args only",
+			taskCfg: TaskConfig{
+				RootfsMount: "/.rootfs",
+				Args:        []string{"/sbin/init", "--log-level=debug"},
+				Socket:      "default",
+			},
+			mounts: []*drivers.MountConfig{{TaskPath: "/.rootfs", HostPath: "/srv/rootfs"}},
+			check: func(t *testing.T, body map[string]any, _ []string) {
+				must.Eq[any](t, "/srv/rootfs", body["rootfs"])
+				must.Eq[any](t, []any{"/sbin/init", "--log-level=debug"}, body["command"])
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				lock       sync.Mutex
+				paths      []string
+				createBody []byte
+			)
+			// a fake Podman API: no containers, every image exists, and
+			// container create is answered with an error once its body is recorded
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				lock.Lock()
+				defer lock.Unlock()
+				paths = append(paths, r.URL.Path)
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/v1.0.0/libpod/containers/create":
+					createBody, _ = io.ReadAll(r.Body)
+					http.Error(w, "intercepted by test", http.StatusInternalServerError)
+				case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.0.0/libpod/images/"):
+					_, _ = fmt.Fprintf(w, `{"Id": %q}`, imageID)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			task := &drivers.TaskConfig{
+				ID:        uuid.Generate(),
+				Name:      "create_request",
+				AllocID:   uuid.Generate(),
+				Resources: createBasicResources(),
+				Mounts:    tc.mounts,
+			}
+			must.NoError(t, task.EncodeConcreteDriverConfig(&tc.taskCfg))
+
+			d := podmanDriverHarness(t, map[string]interface{}{
+				"Socket": []PluginSocketConfig{{Name: "default", SocketPath: server.URL}},
+			})
+			cleanup := d.MkAllocDir(task, false)
+			defer cleanup()
+
+			_, _, err := d.StartTask(task)
+			must.ErrorContains(t, err, "intercepted by test")
+
+			lock.Lock()
+			defer lock.Unlock()
+			var body map[string]any
+			must.NoError(t, json.Unmarshal(createBody, &body))
+			tc.check(t, body, paths)
+		})
+	}
+}
+
+// mountDestinations returns the destinations of the mounts in a container
+// create request body.
+func mountDestinations(t *testing.T, body map[string]any) []string {
+	t.Helper()
+	mounts, ok := body["mounts"].([]any)
+	must.True(t, ok, must.Sprintf("no mounts in create request: %v", body["mounts"]))
+	var dsts []string
+	for _, m := range mounts {
+		mount, ok := m.(map[string]any)
+		must.True(t, ok)
+		dst, _ := mount["destination"].(string)
+		dsts = append(dsts, dst)
+	}
+	return dsts
+}
+
+// TestPodmanDriver_RootfsMount_SystemdStop verifies how a systemd mode
+// container booted from rootfs_mount is stopped: StopTask must make Podman
+// send systemd's halt signal, SIGRTMIN+3, so that systemd can shut down cleanly
+// instead of being killed when the timeout expires.
+func TestPodmanDriver_RootfsMount_SystemdStop(t *testing.T) {
+	ci.Parallel(t)
+
+	rootfs := exportRootfs(t)
+	// stand-in for systemd that records the stop signal it receives and exits.
+	// 37 is SIGRTMIN+3 as numbered by the kernel (SIGRTMIN is 34 on Linux).
+	initScript := `#!/bin/sh
+trap 'echo SIGRTMIN+3 > /stop-signal; exit 0' 37
+trap 'echo SIGTERM > /stop-signal; exit 0' TERM
+trap 'echo SIGINT > /stop-signal; exit 0' INT
+echo ready > /init-ready
+while true; do sleep 1; done
+`
+	must.NoError(t, os.MkdirAll(filepath.Join(rootfs, "sbin"), 0755))
+	must.NoError(t, os.WriteFile(filepath.Join(rootfs, "sbin", "init"), []byte(initScript), 0755))
+
+	taskCfg := TaskConfig{
+		RootfsMount: "/.rootfs",
+		Command:     "/sbin/init",
+		Socket:      "default",
+	}
+	task := &drivers.TaskConfig{
+		ID:        uuid.Generate(),
+		Name:      "rootfs_mount_systemd_stop",
+		AllocID:   uuid.Generate(),
+		Resources: createBasicResources(),
+		Mounts: []*drivers.MountConfig{{
+			TaskPath: "/.rootfs",
+			HostPath: rootfs,
+		}},
+	}
+	must.NoError(t, task.EncodeConcreteDriverConfig(&taskCfg))
+
+	d := podmanDriverHarness(t, nil)
+	cleanup := d.MkAllocDir(task, true)
+	defer cleanup()
+
+	_, _, err := d.StartTask(task)
+	must.NoError(t, err)
+	defer func() {
+		_ = d.DestroyTask(task.ID, true)
+	}()
+
+	waitCh, err := d.WaitTask(context.Background(), task.ID)
+	must.NoError(t, err)
+
+	// the traps are installed once init reports ready
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, statErr := os.Stat(filepath.Join(rootfs, "init-ready")); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("init did not start in time")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// StopTask ignores the signal argument; SIGINT here would be recorded if it were used
+	stopTimeout := 30 * time.Second
+	start := time.Now()
+	must.NoError(t, d.StopTask(task.ID, stopTimeout, "SIGINT"))
+	elapsed := time.Since(start)
+
+	select {
+	case res := <-waitCh:
+		must.Eq(t, 0, res.ExitCode, must.Sprintf("init did not exit cleanly: %#v", res))
+	case <-time.After(10 * time.Second):
+		t.Fatalf("container did not exit after StopTask")
+	}
+
+	stopSignal, err := os.ReadFile(filepath.Join(rootfs, "stop-signal"))
+	must.NoError(t, err, must.Sprint("init trapped no stop signal, so it was killed"))
+	must.Eq(t, "SIGRTMIN+3\n", string(stopSignal))
+	must.True(t, elapsed < stopTimeout/2, must.Sprintf("stop took %s, init was likely killed after the timeout", elapsed))
+}
+
+// TestPodmanDriver_RootfsMount_Recover verifies that a new driver instance can
+// recover a running container booted from rootfs_mount from its task handle.
+func TestPodmanDriver_RootfsMount_Recover(t *testing.T) {
+	ci.Parallel(t)
+
+	rootfs := exportRootfs(t)
+
+	taskCfg := TaskConfig{
+		RootfsMount: "/.rootfs",
+		Command:     "sleep",
+		Args:        []string{"30"},
+		Socket:      "default",
+	}
+	task := &drivers.TaskConfig{
+		ID:        uuid.Generate(),
+		Name:      "rootfs_mount_recover",
+		AllocID:   uuid.Generate(),
+		Resources: createBasicResources(),
+		Mounts: []*drivers.MountConfig{{
+			TaskPath: "/.rootfs",
+			HostPath: rootfs,
+		}},
+	}
+	must.NoError(t, task.EncodeConcreteDriverConfig(&taskCfg))
+
+	d := podmanDriverHarness(t, nil)
+	cleanup := d.MkAllocDir(task, true)
+	defer cleanup()
+
+	handle, _, err := d.StartTask(task)
+	must.NoError(t, err)
+	defer func() {
+		_ = d.DestroyTask(task.ID, true)
+	}()
+	must.NoError(t, d.WaitUntilStarted(task.ID, 10*time.Second))
+
+	// the persisted task state carries the rootfs_mount option
+	var taskState TaskState
+	must.NoError(t, handle.GetDriverState(&taskState))
+	must.Eq(t, "/.rootfs", taskState.TaskConfig.RootfsMount)
+
+	// recover the task with a new driver, in the event the driver exited
+	testDriver := podmanDriverHarness(t, nil)
+	defer testDriver.Kill()
+	must.NoError(t, testDriver.RecoverTask(handle))
+
+	status, err := testDriver.InspectTask(task.ID)
+	must.NoError(t, err)
+	must.Eq(t, drivers.TaskStateRunning, status.State)
+
+	// sleep ignores SIGTERM as PID 1, so it gets killed after the timeout
+	must.NoError(t, testDriver.StopTask(task.ID, time.Second, ""))
+	must.NoError(t, testDriver.DestroyTask(task.ID, true))
 }

@@ -539,8 +539,8 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	handle := drivers.NewTaskHandle(taskHandleVersion)
 	handle.Config = cfg
 
-	if podmanTaskConfig.Image == "" {
-		return nil, nil, fmt.Errorf("image name required")
+	if err := podmanTaskConfig.validate(); err != nil {
+		return nil, nil, err
 	}
 
 	podmanTaskSocketName := podmanTaskConfig.Socket
@@ -573,6 +573,11 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	case nil:
 	default:
 		return nil, nil, fmt.Errorf("invalid entrypoint type %T", podmanTaskConfig.Entrypoint)
+	}
+
+	// Without an image there is no default entrypoint or command to fall back on.
+	if podmanTaskConfig.RootfsMount != "" && len(allArgs) == 0 && len(createOpts.ContainerBasicConfig.Entrypoint) == 0 {
+		return nil, nil, errors.New("rootfs_mount requires command or entrypoint to be set, as there is no image to provide a default")
 	}
 
 	containerName := BuildContainerName(cfg)
@@ -666,6 +671,14 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	createOpts.ContainerStorageConfig.Image = podmanTaskConfig.Image
 	createOpts.ContainerStorageConfig.InitPath = podmanTaskConfig.InitPath
 	createOpts.ContainerStorageConfig.WorkDir = podmanTaskConfig.WorkingDir
+	if podmanTaskConfig.RootfsMount != "" {
+		rootfs, rootfsErr := rootfsMount(cfg, &podmanTaskConfig)
+		if rootfsErr != nil {
+			return nil, nil, rootfsErr
+		}
+		d.logger.Debug("Using volume mount as container root filesystem", "task", cfg.ID, "rootfs_mount", rootfs.TaskPath, "host_path", rootfs.HostPath)
+		createOpts.ContainerStorageConfig.Rootfs = rootfs.HostPath
+	}
 	allMounts, err := d.containerMounts(cfg, &podmanTaskConfig)
 	if err != nil {
 		return nil, nil, err
@@ -1014,7 +1027,8 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		return nil, nil, fmt.Errorf("failed to inspect container: %s: %w", containerName, err)
 	}
 
-	if !recoverRunningContainer {
+	// A container that boots from rootfs_mount has no image to pull.
+	if !recoverRunningContainer && createOpts.Rootfs == "" {
 		imagePullTimeout, parseErr := time.ParseDuration(podmanTaskConfig.ImagePullTimeout)
 		if parseErr != nil {
 			return nil, nil, fmt.Errorf("failed to parse image_pull_timeout: %w", parseErr)
@@ -1038,7 +1052,9 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 			return nil, nil, fmt.Errorf("failed to create image: %s: %w", createOpts.Image, createErr)
 		}
 		createOpts.Image = imageID
+	}
 
+	if !recoverRunningContainer {
 		createResponse, createErr := podmanClient.ContainerCreate(d.ctx, createOpts)
 		for _, w := range createResponse.Warnings {
 			d.logger.Warn("Create Warning", "warning", w)
@@ -1780,6 +1796,27 @@ func getSElinuxVolumeLabel(vc VolumeConfig, mc *drivers.MountConfig) string {
 	return vc.SelinuxLabel
 }
 
+// rootfsMount returns the task mount (a host or CSI volume_mount) selected by
+// the rootfs_mount option. Its host path is used as the container's root
+// filesystem instead of an image.
+func rootfsMount(task *drivers.TaskConfig, driverConfig *TaskConfig) (*drivers.MountConfig, error) {
+	for _, m := range task.Mounts {
+		if !isRootfsMount(m, driverConfig) {
+			continue
+		}
+		if m.Readonly {
+			return nil, fmt.Errorf("rootfs_mount %q refers to a read-only volume mount, the root filesystem must be writable", driverConfig.RootfsMount)
+		}
+		return m, nil
+	}
+	return nil, fmt.Errorf("rootfs_mount %q does not match the destination of any volume_mount of the task", driverConfig.RootfsMount)
+}
+
+// isRootfsMount reports whether m is the mount selected by rootfs_mount.
+func isRootfsMount(m *drivers.MountConfig, driverConfig *TaskConfig) bool {
+	return driverConfig.RootfsMount != "" && filepath.Clean(m.TaskPath) == filepath.Clean(driverConfig.RootfsMount)
+}
+
 func (d *Driver) containerMounts(task *drivers.TaskConfig, driverConfig *TaskConfig) ([]spec.Mount, error) {
 	var binds []spec.Mount
 	binds = append(binds, spec.Mount{Source: task.TaskDir().SharedAllocDir, Destination: task.Env[taskenv.AllocDir], Type: "bind"})
@@ -1835,6 +1872,11 @@ func (d *Driver) containerMounts(task *drivers.TaskConfig, driverConfig *TaskCon
 
 	// create binds for host volumes, CSI plugins, and CSI volumes
 	for _, m := range task.Mounts {
+		if isRootfsMount(m, driverConfig) {
+			// used as the container's root filesystem, see rootfsMount
+			continue
+		}
+
 		bind := spec.Mount{
 			Type:        "bind",
 			Destination: m.TaskPath,

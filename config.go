@@ -4,6 +4,8 @@
 package main
 
 import (
+	"errors"
+
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad-driver-podman/internal/hclcompat"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
@@ -106,7 +108,7 @@ var (
 		"entrypoint":     hclspec.NewAttr("entrypoint", "any", false), // any for compat
 		"working_dir":    hclspec.NewAttr("working_dir", "string", false),
 		"hostname":       hclspec.NewAttr("hostname", "string", false),
-		"image":          hclspec.NewAttr("image", "string", true),
+		"image":          hclspec.NewAttr("image", "string", false),
 		"arch":           hclspec.NewAttr("arch", "string", false),
 		"os":             hclspec.NewAttr("os", "string", false),
 		"variant":        hclspec.NewAttr("variant", "string", false),
@@ -148,6 +150,7 @@ var (
 		"volumes":         hclspec.NewAttr("volumes", "list(string)", false),
 		"force_pull":      hclspec.NewAttr("force_pull", "bool", false),
 		"readonly_rootfs": hclspec.NewAttr("readonly_rootfs", "bool", false),
+		"rootfs_mount":    hclspec.NewAttr("rootfs_mount", "string", false),
 		"userns":          hclspec.NewAttr("userns", "string", false),
 		"shm_size":        hclspec.NewAttr("shm_size", "string", false),
 	})
@@ -280,7 +283,20 @@ type TaskConfig struct {
 	Variant           string              `codec:"variant"`
 	Privileged        bool                `codec:"privileged"`
 	ReadOnlyRootfs    bool                `codec:"readonly_rootfs"`
+	RootfsMount       string              `codec:"rootfs_mount"`
 	UserNS            string              `codec:"userns"`
 	ShmSize           string              `codec:"shm_size"`
 	SecurityOpt       []string            `codec:"security_opt"`
+}
+
+// validate checks constraints between task config options that cannot be
+// expressed in the HCL spec.
+func (c *TaskConfig) validate() error {
+	switch {
+	case c.Image == "" && c.RootfsMount == "":
+		return errors.New("either image or rootfs_mount must be set")
+	case c.Image != "" && c.RootfsMount != "":
+		return errors.New("image and rootfs_mount are mutually exclusive")
+	}
+	return nil
 }

@@ -1,5 +1,8 @@
  ## UNRELEASED
 
+IMPROVEMENTS:
+* config: Added `rootfs_mount` task configuration option to boot a container from one of the task's volume mounts, such as a CSI volume, instead of an image
+
  ## 0.6.6 (October 26, 2026)
 
 SECURITY:

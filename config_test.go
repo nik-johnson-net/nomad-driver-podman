@@ -204,6 +204,64 @@ func TestConfig_IPCMode(t *testing.T) {
 	must.Eq(t, "host", tc.IPCMode)
 }
 
+func TestConfig_RootfsMount(t *testing.T) {
+	ci.Parallel(t)
+
+	parser := newConfigParser(taskConfigSpec)
+	validHCL := `
+	config {
+		rootfs_mount = "/.rootfs"
+		command      = "/sbin/init"
+	}
+	`
+
+	var tc *TaskConfig
+	parser.ParseHCL(t, validHCL, &tc)
+	must.Eq(t, "/.rootfs", tc.RootfsMount)
+	must.Eq(t, "", tc.Image)
+	must.NoError(t, tc.validate())
+}
+
+func TestTaskConfig_validate(t *testing.T) {
+	ci.Parallel(t)
+
+	cases := []struct {
+		name      string
+		cfg       TaskConfig
+		expectErr string
+	}{
+		{
+			name: "image",
+			cfg:  TaskConfig{Image: "docker://busybox"},
+		},
+		{
+			name: "rootfs_mount",
+			cfg:  TaskConfig{RootfsMount: "/.rootfs"},
+		},
+		{
+			name:      "neither image nor rootfs_mount",
+			cfg:       TaskConfig{},
+			expectErr: "either image or rootfs_mount must be set",
+		},
+		{
+			name:      "both image and rootfs_mount",
+			cfg:       TaskConfig{Image: "docker://busybox", RootfsMount: "/.rootfs"},
+			expectErr: "image and rootfs_mount are mutually exclusive",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg.validate()
+			if tc.expectErr == "" {
+				must.NoError(t, err)
+			} else {
+				must.EqError(t, err, tc.expectErr)
+			}
+		})
+	}
+}
+
 func TestPluginConfig_Parsing(t *testing.T) {
 	ci.Parallel(t)
 

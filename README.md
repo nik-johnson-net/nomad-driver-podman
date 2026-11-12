@@ -238,7 +238,7 @@ plugin "nomad-driver-podman" {
 
 ## Task Configuration
 
-* **image** - The image to run. Accepted transports are `docker` (default if missing), `oci-archive` and `docker-archive`. Images reference as [short-names](https://github.com/containers/image/blob/master/docs/containers-registries.conf.5.md#short-name-aliasing) will be treated according to user-configured preferences. The `oci-archive` and `docker-archive` transports also accept an `http(s)://` URL; the archive is downloaded (bounded by `image_pull_timeout`) and loaded into Podman.
+* **image** - The image to run. Required unless `rootfs_mount` is set. Accepted transports are `docker` (default if missing), `oci-archive` and `docker-archive`. Images reference as [short-names](https://github.com/containers/image/blob/master/docs/containers-registries.conf.5.md#short-name-aliasing) will be treated according to user-configured preferences. The `oci-archive` and `docker-archive` transports also accept an `http(s)://` URL; the archive is downloaded (bounded by `image_pull_timeout`) and loaded into Podman.
 
 ```hcl
 config {
@@ -252,6 +252,85 @@ config {
   image = "oci-archive:https://example.com/images/redis.tar"
 }
 ```
+
+* **rootfs_mount** - (Optional) Boot the container from one of the task's
+  [`volume_mount`](https://developer.hashicorp.com/nomad/docs/job-specification/volume_mount)s
+  instead of an image. Set it to the `destination` of a volume mount; the
+  volume behind it, for example a [CSI volume](https://developer.hashicorp.com/nomad/docs/job-specification/volume)
+  or a host volume, becomes the container's root filesystem and is not also
+  bind mounted into the container. Changes to the root filesystem then persist
+  across task restarts and, with a CSI volume, reschedules to other nodes,
+  except for the paths listed below that are mounted over it.
+  Exactly one of `image` and `rootfs_mount` must be set.
+
+```hcl
+job "workspace" {
+  group "workspace" {
+    volume "root" {
+      type            = "csi"
+      source          = "workspace-root"
+      attachment_mode = "file-system"
+      access_mode     = "single-node-writer"
+    }
+
+    task "workspace" {
+      driver = "podman"
+
+      # time for systemd to shut down cleanly before it is killed
+      kill_timeout = "30s"
+
+      volume_mount {
+        volume      = "root"
+        destination = "/.rootfs"
+      }
+
+      config {
+        rootfs_mount = "/.rootfs"
+        command      = "/sbin/init"
+      }
+    }
+  }
+}
+```
+
+  Requirements and behavior:
+  * The volume must already contain a root filesystem, for example the
+    contents of `podman export` of a container, and must be mounted
+    read-write: a `read_only` volume mount is rejected. CSI volumes must use the
+    `file-system` attachment mode.
+  * Only one container may use a root filesystem at a time. Use a
+    single-writer access mode such as `single-node-writer` and do not scale the
+    group beyond `count = 1`.
+  * There is no image configuration to fall back on, so `command` or
+    `entrypoint` must be set. As with images, `args` alone also works: its
+    first element is run as the command. The working directory, user and
+    environment use Podman's defaults instead of an image's. The image options
+    `force_pull`, `auth`, `auth_soft_fail`, `image_pull_timeout`, `arch`, `os`
+    and `variant` are ignored.
+  * Podman runs the container in [systemd mode](https://docs.podman.io/en/latest/markdown/podman-run.1.html#systemd-true-false-always)
+    when the command is `/sbin/init`, `/usr/sbin/init`, `/usr/local/sbin/init`
+    or a binary named `systemd`, so `command = "/sbin/init"` boots systemd as
+    PID 1, and stopping the task sends it SIGRTMIN+3 for a clean shutdown. Set
+    `kill_timeout` long enough for that shutdown. Do not combine it with
+    `init = true`, which wraps the command and disables this detection.
+  * Not everything in the root filesystem persists. These paths are mounted
+    over the volume, so nothing written to them is stored in it:
+    * in systemd mode, the tmpfs file systems Podman mounts on `/run`,
+      `/run/lock`, `/tmp` and `/var/log/journal`, whose contents are lost when
+      the container stops. To keep the systemd journal,
+      mount another volume on `/var/log/journal`; Podman skips its tmpfs for
+      paths that already have a mount.
+    * `/dev`, `/dev/shm`, `/proc`, `/sys`, and the `/etc/hosts`,
+      `/etc/hostname` and `/etc/resolv.conf` files that Podman generates.
+    * Nomad's `/alloc`, `/local` and `/secrets` directories and any other
+      volume mounts, which are bind mounted as usual.
+  * Podman creates missing mount points inside the volume. Removing the
+    container never deletes the volume's contents.
+  * The `propagation_mode` of the volume mount used as root filesystem does not
+    apply to it.
+  * `userns` and rootless Podman have not been tested with `rootfs_mount`. The
+    files in the volume are used with their on-disk ownership, without any ID
+    mapping.
 
 * **auth** - (Optional) Authenticate to the image registry using a static credential. `tls_verify` can be disabled for insecure registries.
 
