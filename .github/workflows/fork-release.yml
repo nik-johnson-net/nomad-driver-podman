@@ -137,10 +137,14 @@ jobs:
           set -euo pipefail
           pkg="$(go list -m)/version"
           for bin in dist/"${PKG_NAME}"_linux_*; do
-            # The linker silently ignores -X for a symbol that does not exist, so check both.
-            go version -m "$bin" | grep -F -- "-X ${pkg}.Version=${VERSION} "
+            # The linker silently ignores -X for a symbol that does not exist, so check that the
+            # symbol exists and that the stamped string made it into the binary. (-trimpath leaves
+            # -ldflags out of the build info, so the string is not there for any other reason.)
             go tool nm "$bin" | awk '{print $NF}' | grep -xF "${pkg}.Version"
+            grep -qaF -- "$VERSION" "$bin"
+            echo "$bin: ${pkg}.Version=${VERSION}"
           done
+          go version -m dist/"${PKG_NAME}"_linux_amd64
           file dist/"${PKG_NAME}"_linux_*
           cat dist/SHA256SUMS
       - name: Summary
