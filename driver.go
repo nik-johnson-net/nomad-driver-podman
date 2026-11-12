@@ -577,7 +577,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 
 	// Without an image there is no default entrypoint or command to fall back on.
 	if podmanTaskConfig.RootfsMount != "" && len(allArgs) == 0 && len(createOpts.ContainerBasicConfig.Entrypoint) == 0 {
-		return nil, nil, errors.New("rootfs_mount requires command to be set, as there is no image to provide a default")
+		return nil, nil, errors.New("rootfs_mount requires command or entrypoint to be set, as there is no image to provide a default")
 	}
 
 	containerName := BuildContainerName(cfg)
