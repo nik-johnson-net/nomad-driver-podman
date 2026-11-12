@@ -258,8 +258,9 @@ config {
   instead of an image. Set it to the `destination` of a volume mount; the
   volume behind it, for example a [CSI volume](https://developer.hashicorp.com/nomad/docs/job-specification/volume)
   or a host volume, becomes the container's root filesystem and is not also
-  bind mounted into the container. Changes to the whole filesystem then persist
-  across task restarts and, with a CSI volume, reschedules to other nodes.
+  bind mounted into the container. Changes to the root filesystem then persist
+  across task restarts and, with a CSI volume, reschedules to other nodes,
+  except for the paths listed below that are mounted over it.
   Exactly one of `image` and `rootfs_mount` must be set.
 
 ```hcl
@@ -300,21 +301,36 @@ job "workspace" {
   * Only one container may use a root filesystem at a time. Use a
     single-writer access mode such as `single-node-writer` and do not scale the
     group beyond `count = 1`.
-  * There is no image configuration to fall back on, so `command` (or
-    `entrypoint`) must be set, and the working directory, user and environment
-    use Podman's defaults instead of an image's. The image options `force_pull`,
-    `auth`, `auth_soft_fail`, `image_pull_timeout`, `arch`, `os` and `variant`
-    are ignored.
+  * There is no image configuration to fall back on, so `command` or
+    `entrypoint` must be set. As with images, `args` alone also works: its
+    first element is run as the command. The working directory, user and
+    environment use Podman's defaults instead of an image's. The image options
+    `force_pull`, `auth`, `auth_soft_fail`, `image_pull_timeout`, `arch`, `os`
+    and `variant` are ignored.
   * Podman runs the container in [systemd mode](https://docs.podman.io/en/latest/markdown/podman-run.1.html#systemd-true-false-always)
     when the command is `/sbin/init`, `/usr/sbin/init`, `/usr/local/sbin/init`
     or a binary named `systemd`, so `command = "/sbin/init"` boots systemd as
-    PID 1, with SIGRTMIN+3 as stop signal. Do not combine it with `init = true`,
-    which wraps the command and disables this detection.
-  * Podman creates missing mount points, such as `/alloc`, `/local` and
-    `/secrets`, inside the volume. Removing the container never deletes the
-    volume's contents.
+    PID 1, and stopping the task sends it SIGRTMIN+3 for a clean shutdown. Set
+    `kill_timeout` long enough for that shutdown. Do not combine it with
+    `init = true`, which wraps the command and disables this detection.
+  * Not everything in the root filesystem persists. These paths are mounted
+    over the volume, so nothing written to them is stored in it:
+    * in systemd mode, the tmpfs file systems Podman mounts on `/run`,
+      `/run/lock`, `/tmp` and `/var/log/journal`, whose contents are lost when
+      the container stops. To keep the systemd journal,
+      mount another volume on `/var/log/journal`; Podman skips its tmpfs for
+      paths that already have a mount.
+    * `/dev`, `/dev/shm`, `/proc`, `/sys`, and the `/etc/hosts`,
+      `/etc/hostname` and `/etc/resolv.conf` files that Podman generates.
+    * Nomad's `/alloc`, `/local` and `/secrets` directories and any other
+      volume mounts, which are bind mounted as usual.
+  * Podman creates missing mount points inside the volume. Removing the
+    container never deletes the volume's contents.
   * The `propagation_mode` of the volume mount used as root filesystem does not
     apply to it.
+  * `userns` and rootless Podman have not been tested with `rootfs_mount`. The
+    files in the volume are used with their on-disk ownership, without any ID
+    mapping.
 
 * **auth** - (Optional) Authenticate to the image registry using a static credential. `tls_verify` can be disabled for insecure registries.
 
