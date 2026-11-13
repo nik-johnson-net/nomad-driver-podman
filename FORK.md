@@ -13,8 +13,18 @@ need it to keep a whole root filesystem on a persistent volume. Upstream does no
 
 The fork **replaces** the stock driver. It registers as the `podman` plugin, and every existing
 podman job runs on it unchanged. A fork release must therefore never change behavior for image-based
-jobs. The release workflow runs upstream's full lint and test suite (rootful podman on
-ubuntu-24.04) and publishes nothing if any check fails.
+jobs. Before publishing, the release workflow runs these checks on ubuntu-24.04 and publishes
+nothing if any of them fails:
+
+- `make check`: golangci-lint, hclfmt and hclogvet.
+- `make test-ci`: the tests in the root and `./api` packages, against rootful podman. These are
+  the same steps as upstream's `tests.yml`.
+- `go test` of every other package. None of them needs podman, and today only `registry` has tests.
+
+CI tests against Ubuntu 24.04's podman (4.9.x), but the cluster runs Podman 5.8.x on AlmaLinux 10,
+so a green CI run does not prove the release works with the cluster's podman. Roll each release out
+to one node first as a canary. Check that the podman jobs on that node stay healthy, including the
+Ceph CSI plugin, before rolling out to the rest.
 
 ## Version scheme
 
@@ -62,15 +72,25 @@ gh workflow run fork-release.yml --repo nik-johnson-net/nomad-driver-podman --re
 | `SHA256SUMS` | `sha256sum` output: `<hex digest>  <asset name>` |
 
 Asset names do not include the version, so `releases/latest/download/<asset>` works as well as
-`releases/download/<tag>/<asset>`. Install with Ansible (pin the tag):
+`releases/download/<tag>/<asset>`.
+
+Install the binary as `/opt/nomad/plugins/podman`, in place of the stock driver, and pin the tag:
 
 ```yaml
 - ansible.builtin.get_url:
     url: https://github.com/nik-johnson-net/nomad-driver-podman/releases/download/v0.6.6-rootfs.1/nomad-driver-podman_linux_amd64
     checksum: sha256:https://github.com/nik-johnson-net/nomad-driver-podman/releases/download/v0.6.6-rootfs.1/SHA256SUMS
-    dest: /opt/nomad/plugins/nomad-driver-podman
+    dest: /opt/nomad/plugins/podman
     mode: "0755"
 ```
+
+**Remove the stock driver.** When two plugins in the plugin directory share a name, Nomad loads
+the one with the higher version. By semver, `0.6.6-rootfs.1` sorts below `0.6.6`, so with both
+present Nomad silently keeps the stock driver. It logs
+`multiple versions of plugin detected ... older_version=0.6.6-rootfs.1 selected_version=0.6.6`.
+A higher base version would not fix this, because the next stock update would win again. Also, the
+HashiCorp RPM's postinst re-creates a symlink at `/opt/nomad/data/plugins/nomad-driver-podman`, so
+uninstall the RPM rather than only deleting the link.
 
 ## Syncing with upstream
 
