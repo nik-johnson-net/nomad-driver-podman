@@ -165,7 +165,8 @@ jobs:
             # The linker silently ignores -X for a symbol that does not exist, so check that the
             # symbol exists and that the stamped string made it into the binary. (-trimpath leaves
             # -ldflags out of the build info, so the string is not there for any other reason.)
-            go tool nm "$bin" | awk '{print $NF}' | grep -qxF "${pkg}.Version" \
+            # (No grep -q in a pipe: an early exit SIGPIPEs the writer and pipefail fails the step.)
+            go tool nm "$bin" | awk '{print $NF}' | grep -xF "${pkg}.Version" >/dev/null \
               || { echo "::error::$bin: symbol ${pkg}.Version not found"; exit 1; }
             grep -qaF -- "$VERSION" "$bin" \
               || { echo "::error::$bin: version string $VERSION not found"; exit 1; }
