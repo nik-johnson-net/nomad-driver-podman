@@ -688,6 +688,8 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	for idx, device := range podmanTaskConfig.Devices {
 		createOpts.ContainerStorageConfig.Devices[idx] = spec.LinuxDevice{Path: device}
 	}
+	// Add the devices reserved for the task by Nomad device plugins
+	createOpts.ContainerStorageConfig.Devices = append(createOpts.ContainerStorageConfig.Devices, nomadDevices(cfg.Devices)...)
 
 	// Set the nomad slice as cgroup parent
 	if podmanClient.IsCgroupV2() && podmanClient.GetCgroupMgr() == "systemd" {
@@ -1815,6 +1817,28 @@ func rootfsMount(task *drivers.TaskConfig, driverConfig *TaskConfig) (*drivers.M
 // isRootfsMount reports whether m is the mount selected by rootfs_mount.
 func isRootfsMount(m *drivers.MountConfig, driverConfig *TaskConfig) bool {
 	return driverConfig.RootfsMount != "" && filepath.Clean(m.TaskPath) == filepath.Clean(driverConfig.RootfsMount)
+}
+
+// nomadDevices converts the devices reserved for the task by Nomad device
+// plugins into podman devices. Podman parses each path like an entry of the
+// devices option: host-device[:container-device][:permissions].
+func nomadDevices(devices []*drivers.DeviceConfig) []spec.LinuxDevice {
+	var result []spec.LinuxDevice
+	for _, device := range devices {
+		if device == nil || device.HostPath == "" {
+			continue
+		}
+		dst := device.TaskPath
+		if dst == "" {
+			dst = device.HostPath
+		}
+		path := device.HostPath + ":" + dst
+		if device.Permissions != "" {
+			path += ":" + device.Permissions
+		}
+		result = append(result, spec.LinuxDevice{Path: path})
+	}
+	return result
 }
 
 func (d *Driver) containerMounts(task *drivers.TaskConfig, driverConfig *TaskConfig) ([]spec.Mount, error) {
