@@ -405,6 +405,7 @@ config {
 
 * **devices** - (Optional) A list of `host-device[:container-device][:permissions]` definitions.
 Each entry adds a host device to the container. Optional permissions can be used to specify device permissions, it is combination of r for read, w for write, and m for mknod(2). See podman documentation for more details.
+Devices reserved for the task by Nomad [device plugins](https://developer.hashicorp.com/nomad/docs/job-specification/device) are added to the container as well, in addition to the ones listed here.
 
 ```hcl
 config {

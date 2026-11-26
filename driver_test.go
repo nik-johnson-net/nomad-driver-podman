@@ -1390,6 +1390,56 @@ func TestPodmanDriver_Device(t *testing.T) {
 
 }
 
+// TestNomadDevices verifies the conversion of devices reserved by Nomad device
+// plugins into podman devices.
+func TestNomadDevices(t *testing.T) {
+	ci.Parallel(t)
+
+	cases := []struct {
+		name    string
+		devices []*drivers.DeviceConfig
+		expect  []spec.LinuxDevice
+	}{
+		{
+			name: "no devices",
+		},
+		{
+			name:    "host path only",
+			devices: []*drivers.DeviceConfig{{HostPath: "/dev/ttyUSB0"}},
+			expect:  []spec.LinuxDevice{{Path: "/dev/ttyUSB0:/dev/ttyUSB0"}},
+		},
+		{
+			name:    "task path and permissions",
+			devices: []*drivers.DeviceConfig{{HostPath: "/dev/bus/usb/001/004", TaskPath: "/dev/sdr0", Permissions: "rw"}},
+			expect:  []spec.LinuxDevice{{Path: "/dev/bus/usb/001/004:/dev/sdr0:rw"}},
+		},
+		{
+			name:    "permissions without task path",
+			devices: []*drivers.DeviceConfig{{HostPath: "/dev/nvidia0", Permissions: "rwm"}},
+			expect:  []spec.LinuxDevice{{Path: "/dev/nvidia0:/dev/nvidia0:rwm"}},
+		},
+		{
+			name: "nil devices and devices without host path are skipped",
+			devices: []*drivers.DeviceConfig{
+				nil,
+				{TaskPath: "/dev/sdr0", Permissions: "rw"},
+				{HostPath: "/dev/nvidia0", TaskPath: "/dev/nvidia0"},
+				{HostPath: "/dev/nvidiactl", TaskPath: "/dev/nvidiactl", Permissions: "rw"},
+			},
+			expect: []spec.LinuxDevice{
+				{Path: "/dev/nvidia0:/dev/nvidia0"},
+				{Path: "/dev/nvidiactl:/dev/nvidiactl:rw"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			must.Eq(t, tc.expect, nomadDevices(tc.devices))
+		})
+	}
+}
+
 // test memory/swap options
 func TestPodmanDriver_Swap(t *testing.T) {
 	ci.Parallel(t)
